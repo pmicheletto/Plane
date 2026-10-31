@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pitch &amp; Roll simulation</title>
+<style>
+  :root { --bg:#0b1220; --panel:#151c27; --text:#e9ecef; --muted:#97a3b4; --accent:#4dabf7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; }
+  header { padding:12px 20px 0; }
+  h1 { margin:0; font-size:20px; font-weight:600; }
+  .muted { color:var(--muted); }
+  main { display:grid; gap:12px; padding:12px 20px; grid-template-columns:1fr 260px;
+         grid-template-areas:"scene side" "controls controls" "charts charts"; }
+  #scene   { grid-area:scene; height:440px; cursor:grab; touch-action:none; }
+  .side    { grid-area:side; display:flex; flex-direction:column; gap:12px; }
+  #horizon { width:240px; height:240px; align-self:center; }
+  .panel   { background:var(--panel); border-radius:8px; padding:12px 14px; }
+  #formula { font:12.5px ui-monospace, Menlo, monospace; }
+  #formula .pitch { color:#4dabf7; } #formula .roll { color:#ff8787; }
+  .controls { grid-area:controls; display:flex; flex-wrap:wrap; gap:10px 18px; align-items:center; }
+  #charts  { grid-area:charts; height:280px; cursor:crosshair; touch-action:none; }
+  canvas   { display:block; width:100%; height:100%; border-radius:8px; background:var(--panel); }
+  button, select { background:#1c2532; color:var(--text); border:1px solid #2f3b4c; border-radius:6px; padding:6px 12px; font-size:14px; cursor:pointer; }
+  #play { background:var(--accent); color:#061222; font-weight:600; min-width:96px; }
+  label { display:inline-flex; gap:6px; align-items:center; color:var(--muted); }
+  #scrub { flex:1 1 100%; accent-color:var(--accent); }
+  footer { padding:0 20px 16px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pitch &amp; Roll from a 3-axis accelerometer</h1>
+  <p class="muted" id="meta"></p>
+</header>
+<main>
+  <canvas id="scene"></canvas>
+  <aside class="side">
+    <canvas id="horizon" width="240" height="240"></canvas>
+    <div id="formula" class="panel"></div>
+  </aside>
+  <section class="controls panel">
+    <button id="play">▶ Play</button>
+    <label>Speed <select id="speed">
+      <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
+    </select></label>
+    <label><input type="checkbox" id="loop" checked> Loop</label>
+    <label><input type="checkbox" id="upsideDown" checked> Sensor mounted upside down (roll + 180°)</label>
+    <label><input type="checkbox" id="showG" checked> Show measured g</label>
+    <input type="range" id="scrub" min="0" max="1000" value="0">
+  </section>
+  <canvas id="charts"></canvas>
+</main>
+<footer class="muted">Space: play/pause · ←/→: step one sample · drag the 3D view to orbit · click the charts to seek.</footer>
+
+<script>
+'use strict';
+// =============================================================================
+// 1. DATA — written by the C++ program. Each row: [t_ms, ax, ay, az, pitch°, roll°]
+// =============================================================================
+const META = { source: '__SOURCE_NAME__', equations: '__EQUATIONS__' };
+const DATA = __DATA__;
+const N = DATA.length, T0 = DATA[0][0], T1 = DATA[N - 1][0], DURATION = T1 - T0;
+
+// =============================================================================
+// 2. MATH — the orientation that corresponds to (pitch, roll)
+//    Frames: x forward (nose), y left wing, z up.  R = Ry(pitch) · Rx(roll)
+//    maps body coordinates to world coordinates (NXP AN3461 xyz sequence).
+// =============================================================================
+const rad = d => d * Math.PI / 180;
+function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
+function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]]; }
+function mul(A, B) { return A.map((r, i) => [0,1,2].map(j => r[0]*B[0][j] + r[1]*B[1][j] + r[2]*B[2][j])); }
+function apply(M, v) { return M.map(r => r[0]*v[0] + r[1]*v[1] + r[2]*v[2]); }
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm = v => { const l = Math.hypot(...v) || 1; return v.map(c => c / l); };
+const wrap180 = d => ((d + 180) % 360 + 360) % 360 - 180;
+const lerpAngle = (a, b, f) => wrap180(a + wrap180(b - a) * f);   // shortest arc: no spin at ±180°
+
+// =============================================================================
+// 3. PLAYBACK STATE
+// =============================================================================
+const ui = id => document.getElementById(id);
+let time = T0, playing = false, lastWall = 0;
+
+/** Interpolated sample at the current time. Applies the mounting correction for display. */
+function currentFrame() {
+  let lo = 0, hi = N - 1;                                    // binary search: last row with t <= time
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; (DATA[m][0] <= time ? lo = m : hi = m); }
+  const a = DATA[lo], b = DATA[Math.min(lo + 1, N - 1)];
+  const f = b[0] > a[0] ? Math.min(1, Math.max(0, (time - a[0]) / (b[0] - a[0]))) : 0;
+  const L = i => a[i] + (b[i] - a[i]) * f;
+  // A sensor mounted upside down (rotated 180° about X) reads (x, -y, -z).
+  // For these equations that is exactly roll + 180° with pitch unchanged.
+  const flip = ui('upsideDown').checked;
+  return {
+    index: lo,
+    accel: flip ? [L(1), -L(2), -L(3)] : [L(1), L(2), L(3)],
+    pitch: lerpAngle(a[4], b[4], f),
+    roll: flip ? wrap180(lerpAngle(a[5], b[5], f) + 180) : lerpAngle(a[5], b[5], f),
+    rawPitch: lerpAngle(a[4], b[4], f), rawRoll: lerpAngle(a[5], b[5], f),
+  };
+}
+
+function seek(t) { time = Math.min(T1, Math.max(T0, t)); draw(); }
+function setPlaying(p) { playing = p; ui('play').textContent = p ? '⏸ Pause' : '▶ Play'; if (p) { lastWall = performance.now(); requestAnimationFrame(tick); } }
+function tick(now) {
+  if (!playing) return;
+  time += (now - lastWall) * Number(ui('speed').value);
+  lastWall = now;
+  if (time > T1) { if (ui('loop').checked) time = T0 + (time - T0) % DURATION; else { time = T1; setPlaying(false); } }
+  draw();
+  if (playing) requestAnimationFrame(tick);
+}
+
+// =============================================================================
+// 4. AIRPLANE MESH — boxes in body coordinates; wing tips use nav-light colours
+// =============================================================================
+function box(cx, cy, cz, sx, sy, sz, color) {
+  const [hx, hy, hz] = [sx/2, sy/2, sz/2];
+  const v = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]
+    .map(([x, y, z]) => [cx + x*hx, cy + y*hy, cz + z*hz]);
+  const quads = [[0,3,2,1],[4,5,6,7],[0,1,5,4],[2,3,7,6],[1,2,6,5],[3,0,4,7]];   // outward-facing
+  return quads.flatMap(([a, b, c, d]) => [{ v:[v[a],v[b],v[c]], color }, { v:[v[a],v[c],v[d]], color }]);
+}
+const MESH = [
+  ...box( 0.0,  0,     0,    3.0, 0.38, 0.38, '#d8dde6'),   // fuselage
+  ...box( 1.75, 0,     0,    0.5, 0.26, 0.26, '#eef1f6'),   // nose
+  ...box( 0.2,  0,    -0.04, 0.6, 3.4,  0.07, '#b9c2d0'),   // main wing
+  ...box( 0.2,  1.62, -0.04, 0.55,0.16, 0.08, '#e53935'),   // left wing tip  (red)
+  ...box( 0.2, -1.62, -0.04, 0.55,0.16, 0.08, '#43a047'),   // right wing tip (green)
+  ...box(-1.3,  0,     0.05, 0.4, 1.3,  0.06, '#aab3c2'),   // horizontal stabiliser
+  ...box(-1.3,  0,     0.42, 0.4, 0.06, 0.7,  '#aab3c2'),   // vertical fin
+  ...box(-0.15, 0,     0.3,  0.7, 0.3,  0.22, '#4a90d9'),   // canopy
+];
+for (const t of MESH) t.n = norm(cross(sub(t.v[1], t.v[0]), sub(t.v[2], t.v[0])));   // face normals
+function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+
+// =============================================================================
+// 5. 3D SCENE — perspective projection onto a 2D canvas, painter's algorithm
+// =============================================================================
+const camera = { yaw: rad(-35), elev: rad(22), dist: 9 };
+const LIGHT = norm([0.4, 0.6, 1.0]);
+
+function drawScene(frame) {
+  const c = ui('scene'), ctx = c.getContext('2d'), w = c.clientWidth, h = c.clientHeight;
+  const pos = [camera.dist * Math.cos(camera.elev) * Math.cos(camera.yaw), camera.dist * Math.cos(camera.elev) * Math.sin(camera.yaw), camera.dist * Math.sin(camera.elev)];
+  const fwd = norm(pos.map(x => -x)), right = norm(cross(fwd, [0,0,1])), up = cross(right, fwd);
+  const P = p => { const d = sub(p, pos), z = dot(d, fwd); const f = Math.min(w, h) * 0.95 / z; return { x: w/2 + f*dot(d, right), y: h/2 - f*dot(d, up), z }; };
+  const line = (a, b, color, width = 1, dash = []) => { const A = P(a), B = P(b); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke(); ctx.setLineDash([]); };
+  const label = (p, text, color) => { const Q = P(p); ctx.fillStyle = color; ctx.font = '12px system-ui'; ctx.fillText(text, Q.x + 6, Q.y - 6); };
+
+  ctx.fillStyle = '#0f1c2e'; ctx.fillRect(0, 0, w, h);
+
+  // ground grid
+  for (let i = -8; i <= 8; i++) {
+    const col = i === 0 ? 'rgba(120,160,220,0.5)' : 'rgba(90,120,170,0.25)';
+    line([i, -8, -2.2], [i, 8, -2.2], col); line([-8, i, -2.2], [8, i, -2.2], col);
+  }
+
+  // airplane
+  const R = mul(rotY(rad(frame.pitch)), rotX(rad(frame.roll)));
+  const faces = [];
+  for (const t of MESH) {
+    const wv = t.v.map(v => apply(R, v)), n = apply(R, t.n);
+    const centre = wv[0].map((_, i) => (wv[0][i] + wv[1][i] + wv[2][i]) / 3);
+    if (dot(n, sub(pos, centre)) <= 0) continue;                       // back-face culling
+    const pts = wv.map(P), shade = 0.45 + 0.55 * Math.max(0, dot(n, LIGHT));
+    faces.push({ pts, depth: pts[0].z + pts[1].z + pts[2].z, color: shadeColor(t.color, shade) });
+  }
+  faces.sort((a, b) => b.depth - a.depth);                             // far to near
+  for (const f of faces) {
+    ctx.fillStyle = ctx.strokeStyle = f.color; ctx.lineWidth = 0.6;
+    ctx.beginPath(); ctx.moveTo(f.pts[0].x, f.pts[0].y); ctx.lineTo(f.pts[1].x, f.pts[1].y); ctx.lineTo(f.pts[2].x, f.pts[2].y); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+
+  // body axes
+  line([0,0,0], apply(R, [2.4,0,0]), '#ff6b6b', 1.2); label(apply(R, [2.4,0,0]), 'x (nose)', '#ff6b6b');
+  line([0,0,0], apply(R, [0,2.4,0]), '#69db7c', 1.2); label(apply(R, [0,2.4,0]), 'y (left)', '#69db7c');
+  line([0,0,0], apply(R, [0,0,2.4]), '#74c0fc', 1.2); label(apply(R, [0,0,2.4]), 'z (up)', '#74c0fc');
+
+  // measured acceleration, carried along with the body. The accelerometer
+  // reads the reaction to gravity, so if (pitch, roll) describe the data
+  // correctly this arrow is vertical — a visual check of the equations.
+  let note = '';
+  if (ui('showG').checked) {
+    const g = apply(R, norm(frame.accel));
+    const offDeg = Math.acos(Math.min(1, Math.max(-1, g[2]))) * 180 / Math.PI;
+    const ok = offDeg < 1;
+    line([0,0,0], [0,0,3.0], 'rgba(255,255,255,0.45)', 1.2, [6,5]);
+    line([0,0,0], g.map(x => x * 2.6), ok ? '#ffd43b' : '#ff922b', 2.5);
+    label([0,0,3.0], ok ? 'measured g = up ✓' : 'measured g', ok ? '#ffd43b' : '#ff922b');
+    note = ok ? 'Measured g is vertical: the angles are consistent with the data.'
+              : `Measured g is ${offDeg.toFixed(1)}° off vertical: these equations do not describe the rotation.`;
+    ctx.fillStyle = ok ? '#ffd43b' : '#ff922b';
+  }
+
+  // HUD
+  ctx.font = '13px ui-monospace, Menlo, monospace';
+  if (note) ctx.fillText(note, 12, 40);
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`t = ${((time - T0) / 1000).toFixed(2).padStart(6)} s   pitch = ${fmt(frame.pitch)}°   roll = ${fmt(frame.roll)}°`, 12, 20);
+}
+const fmt = v => ((v >= 0 ? '+' : '') + v.toFixed(1)).padStart(6);
+function shadeColor(hex, k) { const n = parseInt(hex.slice(1), 16); return `rgb(${((n>>16)&255)*k|0},${((n>>8)&255)*k|0},${(n&255)*k|0})`; }
+
+// =============================================================================
+// 6. ARTIFICIAL HORIZON — aviation convention: nose-up positive, so pitch is
+//    negated here (in the AN3461 frame, gravity along +x gives negative pitch).
+// =============================================================================
+function drawHorizon(frame) {
+  const c = ui('horizon'), ctx = c.getContext('2d'), w = c.clientWidth, h = c.clientHeight, r = Math.min(w, h) / 2 - 6;
+  const pitch = -frame.pitch, roll = frame.roll, pxPerDeg = 3.2;
+  ctx.clearRect(0, 0, w, h);
+  ctx.save(); ctx.translate(w/2, h/2);
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.clip();
+  ctx.rotate(-rad(roll)); ctx.translate(0, pitch * pxPerDeg);
+  ctx.fillStyle = '#3d8bd6'; ctx.fillRect(-4*r, -4*r, 8*r, 4*r);          // sky
+  ctx.fillStyle = '#8b5a2b'; ctx.fillRect(-4*r, 0, 8*r, 4*r);             // ground
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-4*r, 0); ctx.lineTo(4*r, 0); ctx.stroke();
+  ctx.font = '11px system-ui'; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.lineWidth = 1.5;
+  for (let d = -90; d <= 90; d += 10) {                                    // pitch ladder
+    if (!d) continue;
+    const y = -d * pxPerDeg; ctx.beginPath(); ctx.moveTo(-28, y); ctx.lineTo(28, y); ctx.stroke();
+    ctx.fillText(Math.abs(d), -42, y + 4); ctx.fillText(Math.abs(d), 42, y + 4);
+  }
+  ctx.restore();
+  ctx.save(); ctx.translate(w/2, h/2);                                     // fixed parts
+  ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.stroke();
+  ctx.lineWidth = 2;
+  for (const d of [-60,-45,-30,-20,-10,0,10,20,30,45,60]) { const a = rad(-90 + d), l = d % 30 ? 8 : 14; ctx.beginPath(); ctx.moveTo((r-l)*Math.cos(a), (r-l)*Math.sin(a)); ctx.lineTo(r*Math.cos(a), r*Math.sin(a)); ctx.stroke(); }
+  ctx.save(); ctx.rotate(-rad(roll)); ctx.fillStyle = '#ffd43b';          // roll pointer
+  ctx.beginPath(); ctx.moveTo(0, -r+4); ctx.lineTo(-7, -r+18); ctx.lineTo(7, -r+18); ctx.closePath(); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = '#ffd43b'; ctx.lineWidth = 4; ctx.lineCap = 'round';  // aircraft symbol
+  ctx.beginPath(); ctx.moveTo(-r*0.55, 0); ctx.lineTo(-r*0.18, 0); ctx.lineTo(-r*0.18, r*0.08); ctx.moveTo(r*0.55, 0); ctx.lineTo(r*0.18, 0); ctx.lineTo(r*0.18, r*0.08); ctx.stroke();
+  ctx.fillStyle = '#ffd43b'; ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// =============================================================================
+// 7. CHARTS — pitch/roll and ax/ay/az over time with a playback cursor
+// =============================================================================
+let chartCache = null;   // the curves never change; draw them once and only move the cursor
+const PANELS = [
+  { title: 'Angles as displayed (°)',        cols: [[4, '#4dabf7', 'pitch'], [5, '#ff8787', 'roll']] },
+  { title: 'Acceleration as recorded (mg)',  cols: [[1, '#ff6b6b', 'ax'], [2, '#69db7c', 'ay'], [3, '#74c0fc', 'az']] },
+];
+/** Value of a column for plotting: roll gets the same +180° display correction as the airplane. */
+function val(row, col) { return col === 5 && ui('upsideDown').checked ? wrap180(row[col] + 180) : row[col]; }
+const M = { l: 48, r: 14, t: 20, b: 22, gap: 40 };
+function panelRects(w, h) { const ph = (h - M.t - M.b - M.gap) / 2; return PANELS.map((p, i) => ({ ...p, x: M.l, y: M.t + i * (ph + M.gap), w: w - M.l - M.r, h: ph })); }
+function panelRange(p) { let lo = Infinity, hi = -Infinity; for (const row of DATA) for (const [i] of p.cols) { lo = Math.min(lo, val(row, i)); hi = Math.max(hi, val(row, i)); } const pad = (hi - lo) * 0.08 || 1; return [lo - pad, hi + pad]; }
+
+function drawCharts(frame) {
+  const c = ui('charts'), ctx = c.getContext('2d'), w = c.clientWidth, h = c.clientHeight;
+  if (!chartCache) {
+    chartCache = document.createElement('canvas'); chartCache.width = c.width; chartCache.height = c.height;
+    const cc = chartCache.getContext('2d'); cc.setTransform(c.width / w, 0, 0, c.height / h, 0, 0);
+    cc.fillStyle = '#151c27'; cc.fillRect(0, 0, w, h);
+    for (const p of panelRects(w, h)) {
+      const [lo, hi] = panelRange(p), X = i => p.x + (DATA[i][0] - T0) / DURATION * p.w, Y = v => p.y + (hi - v) / (hi - lo) * p.h;
+      cc.fillStyle = '#1c2532'; cc.fillRect(p.x, p.y, p.w, p.h);
+      cc.font = '11px system-ui'; cc.fillStyle = '#adb5bd'; cc.strokeStyle = '#2f3b4c'; cc.lineWidth = 1; cc.textAlign = 'right';
+      const step = niceStep(hi - lo, 5);
+      for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) { cc.beginPath(); cc.moveTo(p.x, Y(v)); cc.lineTo(p.x + p.w, Y(v)); cc.stroke(); cc.fillText(v.toFixed(0), p.x - 6, Y(v) + 4); }
+      cc.textAlign = 'center';
+      for (let s = 0; s <= DURATION / 1000; s += niceStep(DURATION / 1000, 8)) cc.fillText(s + 's', p.x + s * 1000 / DURATION * p.w, p.y + p.h + 14);
+      cc.textAlign = 'left'; cc.fillStyle = '#dee2e6'; cc.fillText(p.title, p.x, p.y - 6);
+      let lx = p.x + p.w; for (const [, color, name] of [...p.cols].reverse()) { cc.textAlign = 'right'; cc.fillStyle = color; cc.fillText(name, lx, p.y - 6); lx -= cc.measureText(name).width + 14; }
+      cc.save(); cc.beginPath(); cc.rect(p.x, p.y, p.w, p.h); cc.clip(); cc.lineWidth = 1.4;
+      const stride = Math.max(1, Math.floor(N / (p.w * 2)));
+      for (const [col, color] of p.cols) {
+        cc.strokeStyle = color; cc.beginPath();
+        for (let i = 0; i < N; i += stride) {
+          const jump = i && Math.abs(val(DATA[i], col) - val(DATA[i - stride], col)) > 180;   // break at ±180° wrap
+          (i === 0 || jump) ? cc.moveTo(X(i), Y(val(DATA[i], col))) : cc.lineTo(X(i), Y(val(DATA[i], col)));
+        }
+        cc.stroke();
+      }
+      cc.restore();
+    }
+  }
+  ctx.clearRect(0, 0, w, h); ctx.drawImage(chartCache, 0, 0, w, h);
+  const row = DATA[frame.index];
+  for (const p of panelRects(w, h)) {                                         // cursor + current values
+    const [lo, hi] = panelRange(p), x = p.x + (time - T0) / DURATION * p.w;
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, p.y); ctx.lineTo(x, p.y + p.h); ctx.stroke();
+    for (const [col, color] of p.cols) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, p.y + (hi - val(row, col)) / (hi - lo) * p.h, 3.5, 0, Math.PI*2); ctx.fill(); }
+  }
+}
+function niceStep(span, ticks) { const raw = span / ticks, mag = 10 ** Math.floor(Math.log10(raw)); for (const m of [1, 2, 5, 10]) if (raw <= m * mag) return m * mag; }
+
+// =============================================================================
+// 8. FORMULA PANEL — the numbers behind the current frame
+// =============================================================================
+function drawFormula(frame) {
+  const [ax, ay, az] = DATA[frame.index].slice(1), n = v => v.toFixed(0);
+  const legacy = META.equations.startsWith('Legacy');
+  const pitchF = legacy ? `atan2(−ay, √(ax²+az²)) = atan2(${n(-ay)}, ${n(Math.hypot(ax, az))})` : `atan2(−ax, √(ay²+az²)) = atan2(${n(-ax)}, ${n(Math.hypot(ay, az))})`;
+  ui('formula').innerHTML =
+    `<div class="muted">${META.equations}</div>
+     <div>ax = <b>${n(ax)}</b>  ay = <b>${n(ay)}</b>  az = <b>${n(az)}</b></div><br>
+     <div>pitch = ${pitchF}<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <b class="pitch">${frame.rawPitch.toFixed(2)}°</b></div><br>
+     <div>roll &nbsp;= atan2(ay, az) = atan2(${n(ay)}, ${n(az)})<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <b class="roll">${frame.rawRoll.toFixed(2)}°</b></div>
+     ${ui('upsideDown').checked ? `<br><div class="muted">displayed roll = ${frame.rawRoll.toFixed(1)}° + 180° = <b class="roll">${frame.roll.toFixed(2)}°</b></div>` : ''}
+     <br><div class="muted">Yaw cannot be measured with an accelerometer alone.</div>`;
+}
+
+// =============================================================================
+// 9. WIRING
+// =============================================================================
+function draw() {
+  const frame = currentFrame();
+  drawScene(frame); drawHorizon(frame); drawCharts(frame); drawFormula(frame);
+  if (document.activeElement !== ui('scrub')) ui('scrub').value = Math.round((time - T0) / DURATION * 1000);
+}
+function fitCanvases() {
+  const dpr = window.devicePixelRatio || 1;
+  for (const id of ['scene', 'horizon', 'charts']) {
+    const c = ui(id); c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr; c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  chartCache = null; draw();
+}
+ui('meta').textContent = `${META.source} — ${N} samples, ${(DURATION / 1000).toFixed(1)} s — equations: ${META.equations}`;
+ui('play').onclick = () => setPlaying(!playing);
+ui('scrub').oninput = e => seek(T0 + e.target.value / 1000 * DURATION);
+ui('showG').onchange = draw;
+ui('upsideDown').onchange = () => { chartCache = null; draw(); };   // curves change → redraw them
+window.onkeydown = e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') { setPlaying(false); const i = currentFrame().index + (e.code === 'ArrowRight' ? 1 : -1); seek(DATA[Math.min(N - 1, Math.max(0, i))][0]); }
+};
+let drag = null;                                                               // orbit camera
+ui('scene').onpointerdown = e => { drag = [e.clientX, e.clientY]; e.target.setPointerCapture(e.pointerId); };
+ui('scene').onpointerup = () => drag = null;
+ui('scene').onpointermove = e => { if (!drag) return; camera.yaw -= (e.clientX - drag[0]) * 0.01; camera.elev = Math.min(1.45, Math.max(-0.3, camera.elev + (e.clientY - drag[1]) * 0.01)); drag = [e.clientX, e.clientY]; draw(); };
+ui('scene').onwheel = e => { e.preventDefault(); camera.dist = Math.min(25, Math.max(4, camera.dist * (1 + Math.sign(e.deltaY) * 0.1))); draw(); };
+let chartDrag = false;                                                         // click/drag charts to seek
+const seekChart = e => { const r = ui('charts').getBoundingClientRect(); seek(T0 + Math.min(1, Math.max(0, (e.clientX - r.left - M.l) / (r.width - M.l - M.r))) * DURATION); };
+ui('charts').onpointerdown = e => { chartDrag = true; e.target.setPointerCapture(e.pointerId); seekChart(e); };
+ui('charts').onpointermove = e => { if (chartDrag) seekChart(e); };
+ui('charts').onpointerup = () => chartDrag = false;
+window.onresize = fitCanvases;
+
+fitCanvases();
+setPlaying(true);
+</script>
+</body>
+</html>
